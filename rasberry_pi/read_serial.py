@@ -3,56 +3,126 @@ import pandas as pd
 import requests
 import json
 import time
-from pyubx2 import UBXReader, UBXMessage
+from pyubx2 import UBXReader, UBXMessage, SET
 import warnings
+import numpy as np
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # URL API strežnika
-API_URL = "http://192.168.1.123:5000/api/test"
+API_URL = "http://127.0.0.1:5000/test"  #"http://192.168.1.123:5000/api/test"
 
 # Funkcija za vklop NAV-SVINFO, NAV-CLOCK, NAV-POSLLH in NAV-TIMEUTC
-def enable_nav_msgs(ser):
-    msg_svinfo = UBXMessage('CFG', 'CFG-MSG', msgmode=1, SET=1, msgClass=0x01, msgID=0x30, rateUART1=1)
-    ser.write(msg_svinfo.serialize())
+def configure_receiver(ser):
+    """
+    Nastavi GNSS sprejemnik tako, da omogoči le sporočila MON-RF in NAV-SAT,
+    ostala izklopi.
+    """
+    messages = [
+        # Omogoči samo MON-RF in NAV-SAT
+        UBXMessage(0x06, 0x01, SET, msgClass=0x0A, msgID=0x38, rateUART1=1, rateUSB=1),  # MON-RF
+        UBXMessage(0x06, 0x01, SET, msgClass=0x01, msgID=0x35, rateUART1=1, rateUSB=1),  # NAV-SAT
+        UBXMessage(0x06, 0x01, SET, msgClass=0x01, msgID=0x21, rateUART1=1, rateUSB=1),  # NAV-TIMEUTC
 
-    msg_clock = UBXMessage('CFG', 'CFG-MSG', msgmode=1, SET=1, msgClass=0x01, msgID=0x22, rateUART1=1)
-    ser.write(msg_clock.serialize())
+        # Izklopi NAV-CLOCK
+        UBXMessage(0x06, 0x01, SET, msgClass=0x01, msgID=0x22, rateUART1=0, rateUSB=0),
+        # Izklopi RXM-MEASX
+        UBXMessage(0x06, 0x01, SET, msgClass=0x02, msgID=0x14, rateUART1=0, rateUSB=0),
+        # Izklopi MON-HW
+        UBXMessage(0x06, 0x01, SET, msgClass=0x0A, msgID=0x09, rateUART1=0, rateUSB=0),
+        # Izklopi MON-HW2
+        UBXMessage(0x06, 0x01, SET, msgClass=0x0A, msgID=0x0B, rateUART1=0, rateUSB=0),
+        # Izklopi MON-SPAN
+        UBXMessage(0x06, 0x01, SET, msgClass=0x0A, msgID=0x31, rateUART1=0, rateUSB=0),
+    ]
 
-    msg_posllh = UBXMessage('CFG', 'CFG-MSG', msgmode=1, SET=1, msgClass=0x01, msgID=0x02, rateUART1=1)
-    ser.write(msg_posllh.serialize())
+    for msg in messages:
+        ser.write(msg.serialize())
+        print(f"Poslano sporočilo: {msg.identity}", flush=True)
 
-    msg_timeutc = UBXMessage('CFG', 'CFG-MSG', msgmode=1, SET=1, msgClass=0x01, msgID=0x21, rateUART1=1)
-    ser.write(msg_timeutc.serialize())
+def set_baudrate_ublox(ser):
+    """
+    Pošlje UBX-CFG-PRT sporočilo za nastavitev baudrate na 115200 za UART1.
+    """
+    msg = UBXMessage(
+        0x06, 0x00, SET,
+        portID=1,
+        reserved0=0,
+        txReady=0,
+        mode=0x08D0,          # 8N1
+        baudRate=115200,
+        inProtoMask=0x0007,   # UBX + NMEA + RTCM
+        outProtoMask=0x0001,  # UBX
+        flags=0,
+        reserved5=0
+    )
+    ser.write(msg.serialize())
+    print("Poslano: nastavitev baudrate na 115200")
 
-# Funkcije za ekstrakcijo podatkov
-def extract_svinfo(ubx_msg):
-    data = {}
-    for i in range(1, ubx_msg.numCh + 1):
-        sv_id = getattr(ubx_msg, f'svid_{i:02}')
-        cno = getattr(ubx_msg, f'cno_{i:02}')
-        data[f'sv_{sv_id}_cno'] = cno
+def extract_nav_sat(ubx_msg):
+    """
+    Iz UBX-NAV-SAT sporočila vrne sat podatke.
+    """
+    GPS_avg = 0
+    GPS_count = 0
+    GALILEO_avg = 0
+    GALILEO_count = 0
+    GLONASS_avg = 0
+    GLONASS_count = 0
+    BEIDOU_avg = 0
+    BEIDOU_count = 0
+    data = {
+        'iTOW': ubx_msg.iTOW,
+        'sat_version': ubx_msg.version,
+        'sat_numSvs': ubx_msg.numSvs
+    }
+
+    for i in range(1, ubx_msg.numSvs + 1):
+        system = getattr(ubx_msg, f'gnssId_{i:02}')
+        sat_num = getattr(ubx_msg, f'svId_{i:02}')
+        system_ids = {0: "GPS", 1: "SBAS", 2: "GALILEO", 3: "BEIDOU", 5:"QZSS", 6:"GLONASS"}
+        system_id = system_ids.get(system, "UNKNOWN")
+        cn = getattr(ubx_msg, f'cno_{i:02}')
+        used = getattr(ubx_msg, f'svUsed_{i:02}')
+        elev = getattr(ubx_msg, f'elev_{i:02}')
+        if system_id == "GPS":
+            GPS_avg += cn*used*np.sin(np.radians(elev))
+            GPS_count += used*np.sin(np.radians(elev))
+        elif system_id == "GLONASS":
+            GLONASS_avg += cn*used*np.sin(np.radians(elev))
+            GLONASS_count += used*np.sin(np.radians(elev))
+        elif system_id == "GALILEO":
+            GALILEO_avg += cn*used*np.sin(np.radians(elev))
+            GALILEO_count += used*np.sin(np.radians(elev))
+        elif system_id == "BEIDOU":
+            BEIDOU_avg += cn*used*np.sin(np.radians(elev))
+            BEIDOU_count += used*np.sin(np.radians(elev))
+
+        data.update({
+            f'sat_cno_{system_id}_{sat_num:02}': cn,
+            f'sat_elev_{system_id}_{sat_num:02}': elev,
+            f'sat_svUsed_{system_id}_{sat_num:02}': used,
+        })
+    data.update({
+        'GPS_avg': GPS_avg/GPS_count if GPS_count != 0 else np.nan,
+        'GALILEO_avg': GALILEO_avg/GALILEO_count if GALILEO_count != 0 else np.nan,
+        'BEIDOU_avg': BEIDOU_avg/BEIDOU_count if BEIDOU_count != 0 else np.nan,
+        'GLONASS_avg': GLONASS_avg/GLONASS_count if GLONASS_count != 0 else np.nan
+    })
     return data
 
-def extract_nav_clock(ubx_msg):
-    return {
-        'iTOW': ubx_msg.iTOW,
-        'clkB': ubx_msg.clkB,
-        'clkD': ubx_msg.clkD,
-        'tAcc': ubx_msg.tAcc,
-        'fAcc': ubx_msg.fAcc
+def extract_mon_rf(ubx_msg,itow):
+    """
+    Iz UBX-NAV-PVT sporočila vrne ključne navigacijske podatke.
+    """
+    data = {                
+        'jammingState_01': ubx_msg.jammingState_01,
+        'jammingState_02': ubx_msg.jammingState_02,
+        'jamInd_01': ubx_msg.jamInd_01,
+        'jamInd_02': ubx_msg.jamInd_02,
+        'iTOW': itow
     }
-
-def extract_nav_posllh(ubx_msg):
-    return {
-        'iTOW': ubx_msg.iTOW,
-        'lon': ubx_msg.lon,
-        'lat': ubx_msg.lat,
-        'height': ubx_msg.height / 1000,
-        'hMSL': ubx_msg.hMSL / 1000,
-        'hAcc': ubx_msg.hAcc / 1000,
-        'vAcc': ubx_msg.vAcc / 1000
-    }
+    return data
 
 def extract_nav_timeutc(ubx_msg):
     return {
@@ -66,8 +136,7 @@ def extract_nav_timeutc(ubx_msg):
     }
 
 # Inicializacija
-port = '/dev/ttyUSB0'
-baudrate = 9600
+port = '/dev/ttyACM0'
 data_buffer = {}
 keys = set()
 current_itow = None
@@ -83,10 +152,15 @@ def send_data_to_api(df):
     except Exception as e:
         print(f"Napaka pri pošiljanju podatkov: {e}")
 
+
+with serial.Serial(port, 38400, timeout=1) as ser:
+    set_baudrate_ublox(ser)
+    time.sleep(0.1)
 # Odpri serijski port
-with serial.Serial(port, baudrate, timeout=1) as ser:
+
+with serial.Serial(port, 115200, timeout=1) as ser:
     ubr = UBXReader(ser, protfilter=2)
-    enable_nav_msgs(ser)
+    configure_receiver(ser)
 
     try:
         while True:
@@ -94,16 +168,14 @@ with serial.Serial(port, baudrate, timeout=1) as ser:
             data = {}
 
             # Preveri vrsto sporočila
-            if parsed_data.identity == "NAV-SVINFO":
-                data = extract_svinfo(parsed_data)
-            elif parsed_data.identity == "NAV-CLOCK":
-                data = extract_nav_clock(parsed_data)
-                current_itow = data['iTOW']
-            elif parsed_data.identity == "NAV-POSLLH":
-                data = extract_nav_posllh(parsed_data)
+            if parsed_data.identity == "NAV-SAT":
+                data = extract_nav_sat(parsed_data)
                 current_itow = data['iTOW']
             elif parsed_data.identity == "NAV-TIMEUTC":
                 data = extract_nav_timeutc(parsed_data)
+                current_itow = data['iTOW']
+            elif parsed_data.identity == "MON-RF":
+                data = extract_mon_rf(parsed_data,current_itow)
                 current_itow = data['iTOW']
 
             if current_itow is None:
@@ -125,7 +197,7 @@ with serial.Serial(port, baudrate, timeout=1) as ser:
 
             # Preveri, ali je preteklo 10 sekund
             if iTOW_sec >= current_df_itow + 10:
-                df = pd.DataFrame(columns=['iTOW_sec'] + list(keys - {'iTOW_sec'}))
+                df = pd.DataFrame(columns=['iTOW_sec','GPS_avg','GALILEO_avg','BEIDOU_avg','GLONASS_avg'] + list(keys - {'iTOW_sec','GPS_avg','GALILEO_avg','BEIDOU_avg','GLONASS_avg'}))
 
                 # Dodaj podatke v DataFrame
                 for sec in sorted(data_buffer.keys()):
@@ -138,7 +210,8 @@ with serial.Serial(port, baudrate, timeout=1) as ser:
                 print(f"Datum: {last_row['day']:02}.{last_row['month']:02}.{last_row['year']} {last_row['hour']:02}:{last_row['min']:02}:{last_row['sec']:02}")
 
                 # Pošlji podatke preko API-ja
-                send_data_to_api(df)
+                #send_data_to_api(df)
+                print(df.head())
 
                 # Počisti buffer
                 data_buffer = {k: v for k, v in data_buffer.items() if k >= current_df_itow + 10}
